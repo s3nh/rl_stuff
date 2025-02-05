@@ -1,109 +1,205 @@
 import numpy as np
-import random
-from collections import deque
-from sklearn.model_selection import train_test_split
-from sklearn.datasets import make_classification
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import copy
+from collections import deque, namedtuple
+import random
 
-# Create an imbalanced dataset
-X, y = make_classification(n_samples=1000, n_features=20, n_classes=2, weights=[0.9, 0.1], random_state=42)
-X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+# Hyperparameters
+BUFFER_SIZE = int(1e6)
+BATCH_SIZE = 128
+GAMMA = 0.99
+TAU = 1e-3
+LR_ACTOR = 1e-4
+LR_CRITIC = 1e-3
+WEIGHT_DECAY = 0
 
-# Define the Q-network
-class QNetwork(nn.Module):
-    def __init__(self, state_size, action_size):
-        super(QNetwork, self).__init__()
-        self.fc1 = nn.Linear(state_size, 24)
-        self.fc2 = nn.Linear(24, 24)
-        self.fc3 = nn.Linear(24, action_size)
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+# Replay Buffer
+class ReplayBuffer:
+    def __init__(self, buffer_size, batch_size):
+        self.memory = deque(maxlen=buffer_size)
+        self.batch_size = batch_size
+        self.experience = namedtuple("Experience", field_names=["state", "action", "reward", "next_state", "done"])
     
-    def forward(self, x):
-        x = torch.relu(self.fc1(x))
-        x = torch.relu(self.fc2(x))
-        x = self.fc3(x)
-        return x
+    def add(self, state, action, reward, next_state, done):
+        e = self.experience(state, action, reward, next_state, done)
+        self.memory.append(e)
+    
+    def sample(self):
+        experiences = random.sample(self.memory, k=self.batch_size)
+        
+        states = torch.from_numpy(np.vstack([e.state for e in experiences if e is not None])).float().to(device)
+        actions = torch.from_numpy(np.vstack([e.action for e in experiences if e is not None])).float().to(device)
+        rewards = torch.from_numpy(np.vstack([e.reward for e in experiences if e is not None])).float().to(device)
+        next_states = torch.from_numpy(np.vstack([e.next_state for e in experiences if e is not None])).float().to(device)
+        dones = torch.from_numpy(np.vstack([e.done for e in experiences if e is not None]).astype(np.uint8)).float().to(device)
+        
+        return (states, actions, rewards, next_states, dones)
+    
+    def __len__(self):
+        return len(self.memory)
 
-class DQN:
-    def __init__(self, state_size, action_size):
+# Actor Network
+class Actor(nn.Module):
+    def __init__(self, state_size, action_size, seed, fc1_units=400, fc2_units=300):
+        super(Actor, self).__init__()
+        self.seed = torch.manual_seed(seed)
+        self.fc1 = nn.Linear(state_size, fc1_units)
+        self.fc2 = nn.Linear(fc1_units, fc2_units)
+        self.fc3 = nn.Linear(fc2_units, action_size)
+        self.bn1 = nn.BatchNorm1d(fc1_units)
+        self.bn2 = nn.BatchNorm1d(fc2_units)
+        self.reset_parameters()
+    
+    def reset_parameters(self):
+        self.fc1.weight.data.uniform_(*hidden_init(self.fc1))
+        self.fc2.weight.data.uniform_(*hidden_init(self.fc2))
+        self.fc3.weight.data.uniform_(-3e-3, 3e-3)
+    
+    def forward(self, state):
+        x = self.fc1(state)
+        x = self.bn1(x)
+        x = torch.relu(x)
+        x = self.fc2(x)
+        x = self.bn2(x)
+        x = torch.relu(x)
+        return torch.tanh(self.fc3(x))
+
+# Critic Network
+class Critic(nn.Module):
+    def __init__(self, state_size, action_size, seed, fcs1_units=400, fc2_units=300):
+        super(Critic, self).__init__()
+        self.seed = torch.manual_seed(seed)
+        self.fcs1 = nn.Linear(state_size, fcs1_units)
+        self.fc2 = nn.Linear(fcs1_units + action_size, fc2_units)
+        self.fc3 = nn.Linear(fc2_units, 1)
+        self.bn1 = nn.BatchNorm1d(fcs1_units)
+        self.reset_parameters()
+    
+    def reset_parameters(self):
+        self.fcs1.weight.data.uniform_(*hidden_init(self.fcs1))
+        self.fc2.weight.data.uniform_(*hidden_init(self.fc2))
+        self.fc3.weight.data.uniform_(-3e-3, 3e-3)
+    
+    def forward(self, state, action):
+        xs = self.fcs1(state)
+        xs = self.bn1(xs)
+        xs = torch.relu(xs)
+        x = torch.cat((xs, action), dim=1)
+        x = self.fc2(x)
+        x = torch.relu(x)
+        return self.fc3(x)
+
+def hidden_init(layer):
+    fan_in = layer.weight.data.size()[0]
+    lim = 1. / np.sqrt(fan_in)
+    return (-lim, lim)
+
+# DDPG Agent
+class DDPGAgent:
+    def __init__(self, state_size, action_size, random_seed):
         self.state_size = state_size
         self.action_size = action_size
-        self.memory = deque(maxlen=2000)
-        self.gamma = 0.95    # discount rate
-        self.epsilon = 1.0  # exploration rate
-        self.epsilon_min = 0.01
-        self.epsilon_decay = 0.995
-        self.learning_rate = 0.001
-        self.model = QNetwork(state_size, action_size)
-        self.criterion = nn.MSELoss()
-        self.optimizer = optim.Adam(self.model.parameters(), lr=self.learning_rate)
-    
-    def remember(self, state, action, reward, next_state, done):
-        self.memory.append((state, action, reward, next_state, done))
-    
-    def act(self, state):
-        if np.random.rand() <= self.epsilon:
-            return random.randrange(self.action_size)
-        state = torch.FloatTensor(state).unsqueeze(0)  # Ensure state has the correct shape
-        with torch.no_grad():
-            act_values = self.model(state)
-        return torch.argmax(act_values).item()
-    
-    def replay(self, batch_size):
-        if len(self.memory) < batch_size:
-            return
+        self.seed = random.seed(random_seed)
         
-        minibatch = random.sample(self.memory, batch_size)
-        for state, action, reward, next_state, done in minibatch:
-            state = torch.FloatTensor(state).unsqueeze(0)  # Ensure state has the correct shape
-            next_state = torch.FloatTensor(next_state).unsqueeze(0)  # Ensure next_state has the correct shape
-            reward = torch.FloatTensor([reward])
-            target = reward
-            if not done:
-                target = (reward + self.gamma * torch.max(self.model(next_state)).item())
-            target_f = self.model(state)
-            print(f"target_f shape: {target_f.shape}, action: {action}")  # Debugging print statement
-            target_f = target_f.clone().detach()  # Clone and detach target_f to avoid in-place modification issues
-            if target_f.size(0) > 0 and action < target_f.size(1):
-                target_f[0][action] = target
-            else:
-                print(f"Skipping invalid assignment: target_f shape: {target_f.shape}, action: {action}")
-            self.optimizer.zero_grad()
-            loss = self.criterion(self.model(state), target_f)
-            loss.backward()
-            self.optimizer.step()
-        if self.epsilon > self.epsilon_min:
-            self.epsilon *= self.epsilon_decay
+        # Actor Network (w/ Target Network)
+        self.actor_local = Actor(state_size, action_size, random_seed).to(device)
+        self.actor_target = Actor(state_size, action_size, random_seed).to(device)
+        self.actor_optimizer = optim.Adam(self.actor_local.parameters(), lr=LR_ACTOR)
+        
+        # Critic Network (w/ Target Network)
+        self.critic_local = Critic(state_size, action_size, random_seed).to(device)
+        self.critic_target = Critic(state_size, action_size, random_seed).to(device)
+        self.critic_optimizer = optim.Adam(self.critic_local.parameters(), lr=LR_CRITIC, weight_decay=WEIGHT_DECAY)
+        
+        # Replay memory
+        self.memory = ReplayBuffer(BUFFER_SIZE, BATCH_SIZE)
+        
+        # Noise process
+        self.noise = OUNoise(action_size, random_seed)
+        
+        self.hard_update(self.actor_target, self.actor_local)
+        self.hard_update(self.critic_target, self.critic_local)
+    
+    def step(self, state, action, reward, next_state, done):
+        self.memory.add(state, action, reward, next_state, done)
+        
+        if len(self.memory) > BATCH_SIZE:
+            experiences = self.memory.sample()
+            self.learn(experiences, GAMMA)
+    
+    def act(self, state, add_noise=True):
+        state = torch.from_numpy(state).float().to(device)
+        self.actor_local.eval()
+        with torch.no_grad():
+            action = self.actor_local(state).cpu().data.numpy()
+        self.actor_local.train()
+        if add_noise:
+            action += self.noise.sample()
+        return np.clip(action, -1, 1)
+    
+    def reset(self):
+        self.noise.reset()
+    
+    def learn(self, experiences, gamma):
+        states, actions, rewards, next_states, dones = experiences
+        
+        # Update Critic
+        actions_next = self.actor_target(next_states)
+        Q_targets_next = self.critic_target(next_states, actions_next)
+        Q_targets = rewards + (gamma * Q_targets_next * (1 - dones))
+        Q_expected = self.critic_local(states, actions)
+        critic_loss = nn.MSELoss()(Q_expected, Q_targets)
+        self.critic_optimizer.zero_grad()
+        critic_loss.backward()
+        self.critic_optimizer.step()
+        
+        # Update Actor
+        actions_pred = self.actor_local(states)
+        actor_loss = -self.critic_local(states, actions_pred).mean()
+        self.actor_optimizer.zero_grad()
+        actor_loss.backward()
+        self.actor_optimizer.step()
+        
+        # Soft update target networks
+        self.soft_update(self.critic_target, self.critic_local, TAU)
+        self.soft_update(self.actor_target, self.actor_local, TAU)
+    
+    def soft_update(self, target, local, tau):
+        for target_param, local_param in zip(target.parameters(), local.parameters()):
+            target_param.data.copy_(tau * local_param.data + (1.0 - tau) * target_param.data)
+    
+    def hard_update(self, target, local):
+        for target_param, local_param in zip(target.parameters(), local.parameters()):
+            target_param.data.copy_(local_param.data)
 
-# Initialize DQN agent
-state_size = X_train.shape[1]
-action_size = 2
-agent = DQN(state_size, action_size)
-batch_size = 32
+# Ornstein-Uhlenbeck Noise
+class OUNoise:
+    def __init__(self, size, seed, mu=0., theta=0.15, sigma=0.2):
+        self.size = size
+        self.mu = mu * np.ones(size)
+        self.theta = theta
+        self.sigma = sigma
+        self.seed = random.seed(seed)
+        self.reset()
+    
+    def reset(self):
+        self.state = copy.copy(self.mu)
+    
+    def sample(self):
+        x = self.state
+        dx = self.theta * (self.mu - x) + self.sigma * np.random.standard_normal(self.size)
+        self.state = x + dx
+        return self.state
 
-# Train the DQN agent
-for e in range(1000):
-    for i in range(len(X_train)):
-        state = np.reshape(X_train[i], [1, state_size])
-        action = agent.act(state)
-        reward = 1 if action == y_train[i] else -1
-        next_state = state
-        done = True
-        agent.remember(state, action, reward, next_state, done)
-        if len(agent.memory) > batch_size:
-            agent.replay(batch_size)
-    if e % 10 == 0:
-        print(f"Episode {e}/{1000}")
+# Example usage:
+state_size = 33  # Example state size
+action_size = 4  # Example action size
+agent = DDPGAgent(state_size, action_size, random_seed=0)
 
-# Evaluate the agent
-correct = 0
-for i in range(len(X_test)):
-    state = np.reshape(X_test[i], [1, state_size])
-    action = agent.act(state)
-    if action == y_test[i]:
-        correct += 1
-
-accuracy = correct / len(X_test)
-print(f"Accuracy: {accuracy * 100:.2f}%")
+# Example training step
+state = np.random.randn(state_size)
+action = agent.act(state)
+agent.step(state, action, 1.0, state, False)
